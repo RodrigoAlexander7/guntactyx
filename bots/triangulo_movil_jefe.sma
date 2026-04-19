@@ -37,6 +37,12 @@ new const float:SPREAD_BLOCK_DIST = 2.1
 new const float:SPREAD_BLOCK_YAW = 0.95
 new const float:SPREAD_BYPASS_ANGLE = 1.10
 new const float:SPREAD_BACK_TIME = 0.30
+new const float:COLLISION_SIDE_TIME = 0.58
+new const float:COLLISION_SIDE_ANGLE = 1.26
+new const float:COLLISION_COOLDOWN = 0.36
+new const float:COLLISION_BLOCK_REPEAT_DT = 0.20
+new const COLLISION_BLOCK_REPEAT_MAX = 4
+new const float:COLLISION_TOUCH_BACK_TIME = 0.28
 new const float:REPULSE_DIST = 2.2
 new const float:REPULSE_GAIN = 2.2
 new const float:WALL_AVOID_DIST = 1.50
@@ -132,6 +138,21 @@ stock bool:tryWalk() {
     return true
   }
   return false
+}
+
+stock bool:tryWalkBk() {
+  if(!moveReady()) return false
+  if(walkbk()) {
+    lastMoveCmdTime = getTime()
+    return true
+  }
+  return false
+}
+
+stock float:getPairSideSign(idA, idB) {
+  if(((idA + idB) % 2) == 0)
+    return 1.0
+  return -1.0
 }
 
 stock getTriangleLevels(followers) {
@@ -440,6 +461,44 @@ stock bool:getBlockingFriendWide(&float:blockYaw, &float:blockDist) {
   return false
 }
 
+stock bool:getFrontBlockInfo(&float:blockYaw,
+                             &float:blockDist,
+                             &blockId,
+                             float:maxDist,
+                             float:maxYaw) {
+  new const FRIEND_WARRIOR = ITEM_FRIEND|ITEM_WARRIOR
+
+  new item
+  new float:dist
+  new float:yaw
+  new float:pitch
+  new id
+  new float:minDist = 0.0
+
+  blockYaw = 0.0
+  blockDist = 0.0
+  blockId = -1
+
+  for(new tries = 0; tries < 8; ++tries) {
+    item = FRIEND_WARRIOR
+    dist = minDist
+    watch(item, dist, yaw, pitch, id)
+    if(item == ITEM_NONE)
+      return false
+
+    if(item == FRIEND_WARRIOR && id != getID() && (!leaderKnown || id != leaderId) && dist < maxDist && abs(yaw) < maxYaw) {
+      blockYaw = yaw
+      blockDist = dist
+      blockId = id
+      return true
+    }
+
+    minDist = dist + 0.35
+  }
+
+  return false
+}
+
 stock getRepulsionVector(&float:rx, &float:ry) {
   new const FRIEND_WARRIOR = ITEM_FRIEND|ITEM_WARRIOR
 
@@ -599,6 +658,13 @@ follower() {
   new float:readyHoldSince = -1000.0
   new float:lastReadySent = -1000.0
   new float:spreadBackUntil = -1000.0
+  new float:collisionBackUntil = -1000.0
+  new float:collisionSideUntil = -1000.0
+  new float:collisionSide = 1.0
+  new float:collisionCooldownUntil = -1000.0
+  new frontBlockId = -1
+  new frontBlockCount = 0
+  new float:lastFrontBlockTick = -1000.0
 
   for(;;) {
     new float:now = getTime()
@@ -619,23 +685,101 @@ follower() {
       lastLeaderSeenTime = now
     }
 
+    if(now < collisionBackUntil) {
+      rotateTo(getDirection() + collisionSide * PI/2.4)
+      if(isStanding() || isWalking() || isRunning() || isWalkingcr())
+        tryWalkBk()
+
+      wait(phaseDt)
+      continue
+    }
+
+    if(now < collisionSideUntil) {
+      rotateTo(getDirection() + collisionSide * COLLISION_SIDE_ANGLE)
+      if(sight() < WALL_AVOID_DIST)
+        rotateTo(getDirection() - collisionSide * PI/2.4)
+
+      tryWalk()
+
+      wait(phaseDt)
+      continue
+    }
+
+    new float:frontYaw = 0.0
+    new float:frontDist = 0.0
+    new frontId = -1
+    new bool:hasFrontBlock = false
+    if(now < spreadUntil)
+      hasFrontBlock = getFrontBlockInfo(frontYaw, frontDist, frontId, SPREAD_BLOCK_DIST, SPREAD_BLOCK_YAW)
+    else
+      hasFrontBlock = getFrontBlockInfo(frontYaw, frontDist, frontId, BLOCK_DIST, BLOCK_YAW)
+
+    if(hasFrontBlock) {
+      if(frontId == frontBlockId && now - lastFrontBlockTick <= COLLISION_BLOCK_REPEAT_DT)
+        ++frontBlockCount
+      else
+        frontBlockCount = 1
+
+      frontBlockId = frontId
+      lastFrontBlockTick = now
+
+      new severeBlock = 0
+      if(frontBlockCount >= COLLISION_BLOCK_REPEAT_MAX || frontDist < 0.95)
+        severeBlock = 1
+
+      if(severeBlock != 0 && now >= collisionCooldownUntil) {
+        new float:pairSide = getPairSideSign(getID(), frontId)
+        if(getID() > frontId)
+          collisionSide = pairSide
+        else
+          collisionSide = -pairSide
+
+        // Un solo bot retrocede (el de ID mayor) y ambos salen por lados opuestos.
+        if(getID() > frontId)
+          collisionBackUntil = now + SPREAD_BACK_TIME
+        else
+          collisionBackUntil = now
+
+        collisionSideUntil = collisionBackUntil + COLLISION_SIDE_TIME
+        collisionCooldownUntil = collisionSideUntil + COLLISION_COOLDOWN
+        frontBlockCount = 0
+
+        wait(phaseDt)
+        continue
+      }
+    } else if(now - lastFrontBlockTick >= COLLISION_BLOCK_REPEAT_DT && frontBlockCount > 0) {
+      --frontBlockCount
+      lastFrontBlockTick = now
+    }
+
+    new touched = getTouched()
+    if(touched && now >= collisionCooldownUntil) {
+      raise(touched)
+
+      collisionSide = (getID()%2 == 0 ? 1.0 : -1.0)
+      collisionBackUntil = now + COLLISION_TOUCH_BACK_TIME
+      collisionSideUntil = collisionBackUntil + COLLISION_SIDE_TIME
+      collisionCooldownUntil = collisionSideUntil + COLLISION_COOLDOWN
+
+      wait(phaseDt)
+      continue
+    }
+
     if(now < spreadBackUntil) {
       rotateTo(spreadAngle)
       if(isStanding() || isWalking() || isRunning() || isWalkingcr())
-        walkbk()
+        tryWalkBk()
 
       wait(phaseDt)
       continue
     }
 
     if(now < separateUntil) {
-      new float:sbYaw
-      new float:sbDist
-      if(getBlockingFriendWide(sbYaw, sbDist)) {
-        new float:side = (sbYaw > 0.0 ? -1.0 : 1.0)
+      if(hasFrontBlock) {
+        new float:side = (frontYaw > 0.0 ? -1.0 : 1.0)
         rotateTo(spreadAngle + side * SPREAD_BYPASS_ANGLE)
 
-        if(sbDist < 1.08)
+        if(frontDist < 1.08)
           spreadBackUntil = now + SPREAD_BACK_TIME
       } else {
         rotateTo(spreadAngle)
