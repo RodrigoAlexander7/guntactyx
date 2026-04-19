@@ -33,12 +33,17 @@ new const float:AXIS_U_HOLD = 0.62
 new const float:AXIS_V_HOLD = 0.72
 new const float:BLOCK_DIST = 1.35
 new const float:BLOCK_YAW = 0.45
+new const float:SPREAD_BLOCK_DIST = 2.1
+new const float:SPREAD_BLOCK_YAW = 0.95
+new const float:SPREAD_BYPASS_ANGLE = 1.10
+new const float:SPREAD_BACK_TIME = 0.30
 new const float:REPULSE_DIST = 2.2
 new const float:REPULSE_GAIN = 2.2
 new const float:WALL_AVOID_DIST = 1.50
 new const float:REACQUIRE_TIMEOUT = 1.70
 
 new const float:FORM_TIMEOUT = 18.0
+new const float:LEADER_FORM_SETTLE_TIME = 1.8
 new const float:READY_HOLD_TIME = 0.90
 new const float:READY_RESEND_DT = 0.95
 new const float:FORM_CENTER_RADIUS = 1.30
@@ -46,6 +51,7 @@ new const float:MOVE_DONE_RADIUS = 1.80
 new const float:MAP_SAFE_HALF = 58.0
 new const float:TARGET_MARGIN = 3.2
 
+new const float:SPAWN_SEPARATE_TIME_BASE = 2.8
 new const float:SPREAD_TIME_BASE = 2.2
 new const float:LOOP_DT = 0.06
 
@@ -415,6 +421,25 @@ stock bool:getBlockingFriend(&float:blockYaw, &float:blockDist) {
   return false
 }
 
+stock bool:getBlockingFriendWide(&float:blockYaw, &float:blockDist) {
+  new const FRIEND_WARRIOR = ITEM_FRIEND|ITEM_WARRIOR
+
+  new item = FRIEND_WARRIOR
+  new float:dist = 0.0
+  new float:yaw
+  new float:pitch
+  new id
+
+  watch(item, dist, yaw, pitch, id)
+  if(item == FRIEND_WARRIOR && (!leaderKnown || id != leaderId) && dist < SPREAD_BLOCK_DIST && abs(yaw) < SPREAD_BLOCK_YAW) {
+    blockYaw = yaw
+    blockDist = dist
+    return true
+  }
+
+  return false
+}
+
 stock getRepulsionVector(&float:rx, &float:ry) {
   new const FRIEND_WARRIOR = ITEM_FRIEND|ITEM_WARRIOR
 
@@ -500,6 +525,7 @@ leader() {
   new bool:centerReached = false
   new bool:targetReached = false
   new float:phaseStart = getTime()
+  new float:centerMoveUnlock = phaseStart + LEADER_FORM_SETTLE_TIME
 
   for(;;) {
     new float:now = getTime()
@@ -507,6 +533,15 @@ leader() {
     sendLeaderPresence(now)
 
     if(!leaderMoveStarted) {
+      if(now < centerMoveUnlock) {
+        if(isMoving())
+          tryStand()
+
+        pollReadyRadioLeader()
+        wait(LOOP_DT)
+        continue
+      }
+
       centerReached = navigateToPoint(mapCx, mapCy, FORM_CENTER_RADIUS)
       pollReadyRadioLeader()
 
@@ -554,7 +589,8 @@ follower() {
   if(rank > followers - 1) rank = followers - 1
 
   new float:spreadAngle = FORMATION_ANGLE + TWO_PI * float(rank) / float(followers)
-  new float:spreadUntil = getTime() + SPREAD_TIME_BASE + float(rank%4) * 0.20
+  new float:separateUntil = getTime() + SPAWN_SEPARATE_TIME_BASE + float(rank%5) * 0.20
+  new float:spreadUntil = separateUntil + SPREAD_TIME_BASE + float(rank%4) * 0.20
 
   rotateTo(spreadAngle)
   if(isStanding())
@@ -562,6 +598,7 @@ follower() {
 
   new float:readyHoldSince = -1000.0
   new float:lastReadySent = -1000.0
+  new float:spreadBackUntil = -1000.0
 
   for(;;) {
     new float:now = getTime()
@@ -580,6 +617,38 @@ follower() {
       lastLeaderDist = d
       lastLeaderAbsDir = adir
       lastLeaderSeenTime = now
+    }
+
+    if(now < spreadBackUntil) {
+      rotateTo(spreadAngle)
+      if(isStanding() || isWalking() || isRunning() || isWalkingcr())
+        walkbk()
+
+      wait(phaseDt)
+      continue
+    }
+
+    if(now < separateUntil) {
+      new float:sbYaw
+      new float:sbDist
+      if(getBlockingFriendWide(sbYaw, sbDist)) {
+        new float:side = (sbYaw > 0.0 ? -1.0 : 1.0)
+        rotateTo(spreadAngle + side * SPREAD_BYPASS_ANGLE)
+
+        if(sbDist < 1.08)
+          spreadBackUntil = now + SPREAD_BACK_TIME
+      } else {
+        rotateTo(spreadAngle)
+      }
+
+      if(sight() < WALL_AVOID_DIST)
+        rotateTo(getDirection() + (getID()%2 == 0 ? PI/6.0 : -PI/6.0))
+
+      if(isStanding())
+        tryWalk()
+
+      wait(phaseDt)
+      continue
     }
 
     if(now < spreadUntil) {
