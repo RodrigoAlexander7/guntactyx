@@ -1,7 +1,7 @@
 // circulo_absoluto_fases.sma
 //
 // Fases estrictas:
-// 1) FORMAR: todos van a posiciones absolutas de un circulo.
+// 1) FORMAR: lider en el centro, followers en un circulo absoluto alrededor.
 // 2) ALINEAR: todos miran al mismo rumbo.
 // 3) AVANZAR: el lider se mueve hacia un lado y el grupo conserva el circulo.
 //
@@ -42,13 +42,13 @@ new const float:CIRCLE_RADIUS_MAX = 4.2
 
 new const float:FORM_POS_RADIUS = 0.95
 new const float:FORM_HOLD_TIME = 0.90
-new const float:FORM_MAX_TIME = 16.0
 new const float:ALIGN_YAW_TOL = 0.14
 new const float:ALIGN_HOLD_TIME = 0.70
 new const float:READY_RESEND_DT = 0.90
 
 new const float:MOVE_DONE_RADIUS = 1.60
 new const float:MOVE_HEADING = 0.0
+new const float:MOVE_SYNC_BIAS = 0.55
 
 new const float:WALL_AVOID_DIST = 1.45
 new const float:BLOCK_DIST = 1.45
@@ -74,8 +74,6 @@ new float:centerStartY = 0.0
 new float:centerTargetX = 0.0
 new float:centerTargetY = 0.0
 
-new float:leaderSlotX = 0.0
-new float:leaderSlotY = 0.0
 new float:mySlotX = 0.0
 new float:mySlotY = 0.0
 
@@ -275,18 +273,25 @@ stock computeSharedGeometry() {
   centerTargetX = clampf(centerTargetX, mapCx - safeHalf + circleRadius, mapCx + safeHalf - circleRadius)
   centerTargetY = clampf(centerTargetY, mapCy - safeHalf + circleRadius, mapCy + safeHalf - circleRadius)
 
-  // Slot del lider (ID 0), usado por followers para reconstruir centro en fase MOVE.
-  leaderSlotX = circleRadius
-  leaderSlotY = 0.0
+  // Lider fijo al centro del circulo.
+  if(getID() == LEADER_ID) {
+    mySlotX = 0.0
+    mySlotY = 0.0
+    return
+  }
 
-  // Slot local de este bot.
-  new rank = getID()
+  // Slots solo para followers en el perimetro.
+  new followers = mates - 1
+  if(followers < 1)
+    followers = 1
+
+  new rank = getID() - 1
   if(rank < 0)
     rank = 0
-  if(rank >= mates)
-    rank = rank % mates
+  if(rank >= followers)
+    rank = rank % followers
 
-  new float:ang = TWO_PI * float(rank) / float(mates)
+  new float:ang = TWO_PI * float(rank) / float(followers)
   mySlotX = circleRadius * cos(ang)
   mySlotY = circleRadius * sin(ang)
 }
@@ -451,7 +456,6 @@ leader() {
   new float:alignHoldSince = -1000.0
   new bool:leaderReadyForm = false
   new bool:leaderReadyAlign = false
-  new float:formStartTime = getTime()
 
   new float:escapeBackUntil = -1000.0
   new float:escapeSideUntil = -1000.0
@@ -486,9 +490,19 @@ leader() {
     new touched = getTouched()
     if(touched) {
       raise(touched)
-      escapeSide = (getID()%2 == 0 ? 1.0 : -1.0)
+      escapeSide = (random(2) == 0 ? 1.0 : -1.0)
       escapeBackUntil = now + ESC_BACK_TIME
       escapeSideUntil = escapeBackUntil + ESC_SIDE_TIME
+
+      wait(LOOP_DT)
+      continue
+    }
+
+    if(frontStuckTicks >= FRONT_STUCK_TICKS_MAX) {
+      escapeSide = (random(2) == 0 ? 1.0 : -1.0)
+      escapeBackUntil = now + ESC_BACK_TIME
+      escapeSideUntil = escapeBackUntil + ESC_SIDE_TIME
+      frontStuckTicks = 0
 
       wait(LOOP_DT)
       continue
@@ -514,7 +528,7 @@ leader() {
           leaderReadyForm = true
       }
 
-      if((leaderReadyForm && readyFormCount >= followersExpected) || now - formStartTime >= FORM_MAX_TIME) {
+      if(leaderReadyForm && readyFormCount >= followersExpected) {
         phase = PHASE_ALIGN
         alignHoldSince = -1000.0
         leaderReadyAlign = false
@@ -615,9 +629,19 @@ follower() {
     new touched = getTouched()
     if(touched) {
       raise(touched)
-      escapeSide = (getID()%2 == 0 ? 1.0 : -1.0)
+      escapeSide = (random(2) == 0 ? 1.0 : -1.0)
       escapeBackUntil = now + ESC_BACK_TIME
       escapeSideUntil = escapeBackUntil + ESC_SIDE_TIME
+
+      wait(LOOP_DT)
+      continue
+    }
+
+    if(frontStuckTicks >= FRONT_STUCK_TICKS_MAX) {
+      escapeSide = (random(2) == 0 ? 1.0 : -1.0)
+      escapeBackUntil = now + ESC_BACK_TIME
+      escapeSideUntil = escapeBackUntil + ESC_SIDE_TIME
+      frontStuckTicks = 0
 
       wait(LOOP_DT)
       continue
@@ -720,14 +744,47 @@ follower() {
     new float:leaderX = x + lastLeaderDist * cos(lastLeaderAbsDir)
     new float:leaderY = y + lastLeaderDist * sin(lastLeaderAbsDir)
 
-    new float:centerX = leaderX - leaderSlotX
-    new float:centerY = leaderY - leaderSlotY
+    new float:centerX = leaderX
+    new float:centerY = leaderY
 
     new float:tx = centerX + mySlotX
     new float:ty = centerY + mySlotY
 
     if(!isAtPoint(tx, ty, FORM_POS_RADIUS)) {
-      navigateToPoint(tx, ty, frontStuckTicks)
+      new float:mx
+      new float:my
+      new float:mz
+      getLocation(mx, my, mz)
+
+      new float:dx = tx - mx
+      new float:dy = ty - my
+      new float:heading = atan2(dy, dx)
+
+      // Mantener direccion comun de avance con una correccion lateral limitada.
+      new float:hd = wrapPi(heading - MOVE_HEADING)
+      if(hd > MOVE_SYNC_BIAS)
+        heading = MOVE_HEADING + MOVE_SYNC_BIAS
+      else if(hd < -MOVE_SYNC_BIAS)
+        heading = MOVE_HEADING - MOVE_SYNC_BIAS
+
+      new float:blockYaw
+      new float:blockDist
+      if(getBlockingFriend(blockYaw, blockDist)) {
+        ++frontStuckTicks
+        if(blockYaw > 0.0)
+          heading -= PI/5.0
+        else
+          heading += PI/5.0
+      } else if(frontStuckTicks > 0) {
+        --frontStuckTicks
+      }
+
+      if(sight() < WALL_AVOID_DIST)
+        heading += (getID()%2 == 0 ? PI/5.5 : -PI/5.5)
+
+      rotateTo(heading)
+      if(isStanding())
+        tryWalk()
     } else {
       rotateTo(MOVE_HEADING)
       if(isStanding())
