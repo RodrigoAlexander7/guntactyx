@@ -402,6 +402,35 @@ stock followerPollPhase(&phase) {
   }
 }
 
+stock followerPollReadyForm() {
+  new word
+  new id
+
+  for(new tries = 0; tries < 6; ++tries) {
+    if(!listen(RADIO_CHANNEL_READY, word, id))
+      break
+
+    if(id <= LEADER_ID || id >= MAX_ID_TRACK)
+      continue
+
+    if(word == WORD_READY_FORM)
+      readyFormFrom[id] = true
+  }
+}
+
+stock bool:followerFormGateOpen() {
+  // ID 1 se forma primero; ID 2 espera a 1; ID 3 espera a 1 y 2; etc.
+  if(getID() <= 1)
+    return true
+
+  for(new id = 1; id < getID() && id < MAX_ID_TRACK; ++id) {
+    if(!readyFormFrom[id])
+      return false
+  }
+
+  return true
+}
+
 leader() {
   computeSharedGeometry()
 
@@ -547,6 +576,9 @@ follower() {
 
   new phase = PHASE_FORM
 
+  for(new i = 0; i < MAX_ID_TRACK; ++i)
+    readyFormFrom[i] = false
+
   new float:lastReadyFormSent = -1000.0
   new float:lastReadyAlignSent = -1000.0
 
@@ -564,6 +596,7 @@ follower() {
     new float:now = getTime()
 
     followerPollPhase(phase)
+    followerPollReadyForm()
 
     if(now < escapeBackUntil) {
       performEscape(escapeSide)
@@ -591,6 +624,15 @@ follower() {
     }
 
     if(phase == PHASE_FORM) {
+      if(!followerFormGateOpen()) {
+        formHoldSince = -1000.0
+        if(isMoving())
+          tryStand()
+
+        wait(LOOP_DT)
+        continue
+      }
+
       new float:tx
       new float:ty
       getAbsTargetFromCenter(centerStartX, centerStartY, tx, ty)
