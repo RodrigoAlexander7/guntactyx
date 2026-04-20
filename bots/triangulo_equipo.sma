@@ -74,6 +74,16 @@ new const float:MAX_CONTINUOUS_BACK_TIME = 0.72
 
 new const float:LOOP_DT = 0.04
 
+new const FORM_SYNC_CHANNEL = 260
+new const WORD_FORM_READY = 9301
+new const WORD_FORM_START = 9302
+new const float:FORM_READY_RESEND_DT = 0.70
+new const float:FORM_START_DELAY = 0.90
+new const float:FORM_START_RESEND_DT = 0.18
+new const float:FORM_START_RESEND_WINDOW = 0.40
+new const float:FORM_ALIGN_YAW = 0.10
+new const float:FORMATION_MARCH_SPEED = 1.45
+
 stock float:wrapPi(float:angle) {
   while(angle > PI) angle -= TWO_PI
   while(angle < -PI) angle += TWO_PI
@@ -259,6 +269,42 @@ stock edgePoint(float:ax, float:ay, float:bx, float:by, float:t, &float:ox, &flo
   oy = ay + (by - ay) * t
 }
 
+stock float:getTriangleAdvanceLimit(float:cx, float:cy, float:r,
+                                    float:dirX, float:dirY,
+                                    float:mapCx, float:mapCy, float:safeHalf) {
+  new float:leftX = cx - 0.8660 * r
+  new float:rightX = cx + 0.8660 * r
+  new float:topY = cy + r
+  new float:bottomY = cy - 0.5000 * r
+
+  new float:tMax = 9999.0
+
+  if(dirX > 0.0001) {
+    new float:t = (mapCx + safeHalf - rightX) / dirX
+    if(t < tMax)
+      tMax = t
+  } else if(dirX < -0.0001) {
+    new float:t = (mapCx - safeHalf - leftX) / dirX
+    if(t < tMax)
+      tMax = t
+  }
+
+  if(dirY > 0.0001) {
+    new float:t = (mapCy + safeHalf - topY) / dirY
+    if(t < tMax)
+      tMax = t
+  } else if(dirY < -0.0001) {
+    new float:t = (mapCy - safeHalf - bottomY) / dirY
+    if(t < tMax)
+      tMax = t
+  }
+
+  if(tMax < 0.0)
+    tMax = 0.0
+
+  return tMax
+}
+
 stock assignTriangleTarget(float:cx, float:cy, float:r, &float:tx, &float:ty) {
   // Jefe al centro.
   if(getID() == 0) {
@@ -347,6 +393,41 @@ formationBot() {
     clampPointInsideSafe(tx, ty, mapCx, mapCy, targetSafeHalf)
   }
 
+  // Objetivo comun de mirada y avance luego de formar el triangulo.
+  new float:lookX = cx
+  new float:lookY = mapCy + targetSafeHalf
+  if(lookY < cy + 1.0)
+    lookY = cy + 1.0
+  clampPointInsideSafe(lookX, lookY, mapCx, mapCy, targetSafeHalf)
+
+  new float:marchDirX = lookX - cx
+  new float:marchDirY = lookY - cy
+  new float:marchNorm = sqrt(marchDirX*marchDirX + marchDirY*marchDirY)
+  if(marchNorm > 0.0001) {
+    marchDirX /= marchNorm
+    marchDirY /= marchNorm
+  } else {
+    marchDirX = 0.0
+    marchDirY = 1.0
+  }
+
+  new float:marchLookAngle = atan2(marchDirY, marchDirX)
+  new float:marchMaxAdvance = getTriangleAdvanceLimit(cx, cy, triR,
+                                                      marchDirX, marchDirY,
+                                                      mapCx, mapCy, targetSafeHalf)
+  new float:formTx = tx
+  new float:formTy = ty
+
+  new bool:isMarching = false
+  new float:marchStartAt = -1000.0
+  new float:lastReadySent = -1000.0
+  new float:lastStartSent = -1000.0
+  new readySeen[64]
+  new readyCount = 0
+  new neededReady = getMates() - 1
+  if(neededReady < 0)
+    neededReady = 0
+
 
   new float:lastCheck = -1000.0
   new float:lastX = cx
@@ -398,6 +479,49 @@ formationBot() {
 
   for(;;) {
     new float:now = getTime()
+
+    // Canales de sincronizacion para el avance en bloque.
+    new syncWord
+    new syncSender
+    if(listen(FORM_SYNC_CHANNEL, syncWord, syncSender)) {
+      if(syncWord == WORD_FORM_READY && getID() == 0) {
+        if(syncSender > 0 && syncSender < 64 && readySeen[syncSender] == 0) {
+          readySeen[syncSender] = 1
+          ++readyCount
+        }
+      } else if(syncWord == WORD_FORM_START && syncSender == 0 && getID() != 0) {
+        if(marchStartAt < -999.0)
+          marchStartAt = now + FORM_START_DELAY
+      }
+    }
+
+    if(!isMarching && marchStartAt > -999.0 && now >= marchStartAt) {
+      isMarching = true
+      arriveLogged = false
+      yieldUntil = -1000.0
+      yieldBackUntil = -1000.0
+      blockScanBackUntil = -1000.0
+      blockScanRearmUntil = -1000.0
+      backoffUntil = -1000.0
+      forceBypassUntil = -1000.0
+      deadlockBackUntil = -1000.0
+      deadlockSideUntil = -1000.0
+      wallBreakBackUntil = -1000.0
+      wallBreakSideUntil = -1000.0
+      wallEscapeUntil = -1000.0
+    }
+
+    if(isMarching) {
+      new float:advance = (now - marchStartAt) * FORMATION_MARCH_SPEED
+      if(advance > marchMaxAdvance)
+        advance = marchMaxAdvance
+      tx = formTx + marchDirX * advance
+      ty = formTy + marchDirY * advance
+      clampPointInsideSafe(tx, ty, mapCx, mapCy, targetSafeHalf)
+    } else {
+      tx = formTx
+      ty = formTy
+    }
 
     // Guard rail: nunca permitir retroceso continuo indefinido.
     if(isWalkingbk()) {
@@ -455,7 +579,7 @@ formationBot() {
 
     // Ancla de destino: cerca del objetivo, cancelar maniobras transitorias
     // para evitar caminar en arco alrededor del punto final.
-    if(arriveLogged && err <= ARRIVE_RESET_RADIUS) {
+    if(!isMarching && arriveLogged && err <= ARRIVE_RESET_RADIUS) {
       yieldUntil = -1000.0
       yieldBackUntil = -1000.0
       blockScanBackUntil = -1000.0
@@ -475,7 +599,7 @@ formationBot() {
       continue
     }
 
-    if(err <= ARRIVE_RADIUS) {
+    if(!isMarching && err <= ARRIVE_RADIUS) {
       if(!arriveLogged) {
         printf("bot %d llego a destino %d,%d^n", getID(), floatround(tx), floatround(ty))
         arriveLogged = true
@@ -494,8 +618,35 @@ formationBot() {
       wallBreakSideUntil = -1000.0
       wallEscapeUntil = -1000.0
 
+      // Todos se alinean al mismo punto antes de arrancar el avance.
+      new float:alignErr = wrapPi(marchLookAngle - getDirection())
+      if(abs(alignErr) > FORM_ALIGN_YAW)
+        rotateTo(marchLookAngle)
+
       if(isWalking() || isRunning() || isWalkingbk() || isWalkingcr())
         stand()
+
+      // Los soldados notifican al jefe que ya estan posicionados.
+      if(getID() != 0) {
+        if(now - lastReadySent >= FORM_READY_RESEND_DT) {
+          if(speak(FORM_SYNC_CHANNEL, WORD_FORM_READY))
+            lastReadySent = now
+        }
+      } else {
+        // El jefe inicia la fase comun solo cuando todos estan listos.
+        if(marchStartAt < -999.0 && readyCount >= neededReady) {
+          marchStartAt = now + FORM_START_DELAY
+          lastStartSent = -1000.0
+        }
+
+        // Repite la orden de inicio por una ventana corta para sincronizar mejor.
+        if(marchStartAt > -999.0 &&
+           now <= marchStartAt + FORM_START_RESEND_WINDOW &&
+           now - lastStartSent >= FORM_START_RESEND_DT) {
+          if(speak(FORM_SYNC_CHANNEL, WORD_FORM_START))
+            lastStartSent = now
+        }
+      }
 
       wait(LOOP_DT)
       continue
@@ -664,7 +815,7 @@ formationBot() {
 
     // Navegacion principal al objetivo.
     new nearFinalApproach = 0
-    if(err <= FINAL_APPROACH_RADIUS)
+    if(!isMarching && err <= FINAL_APPROACH_RADIUS)
       nearFinalApproach = 1
 
     new float:toTarget = atan2(dy, dx)
