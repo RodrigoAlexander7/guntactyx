@@ -20,12 +20,12 @@ new const PHASE_MOVE = 2
 new const RADIO_CHANNEL_PHASE = 81
 new const RADIO_CHANNEL_READY = 82
 
-new const WORD_PHASE_FORM = 9801
-new const WORD_PHASE_ALIGN = 9802
-new const WORD_PHASE_MOVE = 9803
-new const WORD_READY_FORM = 9811
-new const WORD_READY_ALIGN = 9812
-new const WORD_LEADER_PING = 9820
+new const WORD_PHASE_FORM_BASE = 12000
+new const WORD_PHASE_ALIGN = 12100
+new const WORD_PHASE_MOVE = 12101
+new const WORD_READY_FORM = 12211
+new const WORD_READY_ALIGN = 12212
+new const WORD_LEADER_PING = 12220
 
 #define MAX_ID_TRACK 128
 
@@ -348,15 +348,22 @@ stock performEscape(float:side) {
     tryWalkBk()
 }
 
-stock sendPhaseWord(phase, float:now) {
+stock sendPhaseWord(phase, activeFormId, float:now) {
   if(now - lastSpeakPhaseTime < getTimeNeededFor(ACTION_SPEAK))
     return
 
-  new word = WORD_PHASE_FORM
-  if(phase == PHASE_ALIGN)
+  new word
+  if(phase == PHASE_FORM) {
+    if(activeFormId < 1)
+      activeFormId = 1
+    if(activeFormId >= MAX_ID_TRACK)
+      activeFormId = MAX_ID_TRACK - 1
+    word = WORD_PHASE_FORM_BASE + activeFormId
+  } else if(phase == PHASE_ALIGN) {
     word = WORD_PHASE_ALIGN
-  else if(phase == PHASE_MOVE)
+  } else {
     word = WORD_PHASE_MOVE
+  }
 
   if(speak(RADIO_CHANNEL_PHASE, word))
     lastSpeakPhaseTime = now
@@ -387,7 +394,7 @@ stock leaderPollReady() {
   }
 }
 
-stock followerPollPhase(&phase) {
+stock followerPollPhase(&phase, &activeFormId) {
   new word
   new id
 
@@ -398,42 +405,14 @@ stock followerPollPhase(&phase) {
     if(id != LEADER_ID)
       continue
 
-    if(word == WORD_PHASE_FORM)
+    if(word >= WORD_PHASE_FORM_BASE && word < WORD_PHASE_FORM_BASE + MAX_ID_TRACK) {
       phase = PHASE_FORM
-    else if(word == WORD_PHASE_ALIGN)
+      activeFormId = word - WORD_PHASE_FORM_BASE
+    } else if(word == WORD_PHASE_ALIGN)
       phase = PHASE_ALIGN
     else if(word == WORD_PHASE_MOVE)
       phase = PHASE_MOVE
   }
-}
-
-stock followerPollReadyForm() {
-  new word
-  new id
-
-  for(new tries = 0; tries < 6; ++tries) {
-    if(!listen(RADIO_CHANNEL_READY, word, id))
-      break
-
-    if(id <= LEADER_ID || id >= MAX_ID_TRACK)
-      continue
-
-    if(word == WORD_READY_FORM)
-      readyFormFrom[id] = true
-  }
-}
-
-stock bool:followerFormGateOpen() {
-  // ID 1 se forma primero; ID 2 espera a 1; ID 3 espera a 1 y 2; etc.
-  if(getID() <= 1)
-    return true
-
-  for(new id = 1; id < getID() && id < MAX_ID_TRACK; ++id) {
-    if(!readyFormFrom[id])
-      return false
-  }
-
-  return true
 }
 
 leader() {
@@ -451,6 +430,7 @@ leader() {
   readyAlignCount = 0
 
   new phase = PHASE_FORM
+  new activeFormId = 1
 
   new float:formHoldSince = -1000.0
   new float:alignHoldSince = -1000.0
@@ -465,8 +445,19 @@ leader() {
   for(;;) {
     new float:now = getTime()
 
-    sendPhaseWord(phase, now)
     leaderPollReady()
+
+    if(phase == PHASE_FORM) {
+      while(activeFormId <= followersExpected && activeFormId < MAX_ID_TRACK && readyFormFrom[activeFormId])
+        ++activeFormId
+
+      if(activeFormId > followersExpected)
+        activeFormId = followersExpected
+      if(activeFormId < 1)
+        activeFormId = 1
+    }
+
+    sendPhaseWord(phase, activeFormId, now)
 
     if(now - lastSayTime >= getTimeNeededFor(ACTION_SAY)) {
       if(say(WORD_LEADER_PING))
@@ -589,9 +580,7 @@ follower() {
   computeSharedGeometry()
 
   new phase = PHASE_FORM
-
-  for(new i = 0; i < MAX_ID_TRACK; ++i)
-    readyFormFrom[i] = false
+  new activeFormId = 1
 
   new float:lastReadyFormSent = -1000.0
   new float:lastReadyAlignSent = -1000.0
@@ -609,8 +598,7 @@ follower() {
   for(;;) {
     new float:now = getTime()
 
-    followerPollPhase(phase)
-    followerPollReadyForm()
+    followerPollPhase(phase, activeFormId)
 
     if(now < escapeBackUntil) {
       performEscape(escapeSide)
@@ -648,7 +636,7 @@ follower() {
     }
 
     if(phase == PHASE_FORM) {
-      if(!followerFormGateOpen()) {
+      if(getID() != activeFormId) {
         formHoldSince = -1000.0
         if(isMoving())
           tryStand()
